@@ -8,7 +8,8 @@
 //!   file DeckCraft would otherwise download: Save, Save As, the exports and Print's PDF. Save
 //!   writes `<title>.deckcraft`; posting a `.deckcraft` file marks the presentation saved.
 //! - `deckcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
-//! - `deckcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+//! - `deckcraft:failed` (to the parent): `{ error }` when the app couldn't start, or a
+//!   `deckcraft:open` was refused (over `MAX_OPEN_BYTES`, 512 MiB).
 //!
 //! Only the parent window on the page's own origin is heard or answered. In host mode the page
 //! starts on a blank presentation instead of the sample deck. `?author=` names the user
@@ -24,6 +25,14 @@ use wasm_bindgen::closure::Closure;
 
 /// The longest user name taken from `?author=` (the preference's own limit).
 const MAX_AUTHOR_CHARS: usize = 256;
+/// Largest document taken from the parent page, checked before its bytes are copied: the same
+/// 512 MiB as the largest single part DeckCraft's PPTX reader decompresses (`deckcraft_pptx::opc::MAX_PART`).
+const MAX_OPEN_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Why `len` bytes from the parent can't be opened, or `None` if they can.
+fn oversize(len: u64) -> Option<String> {
+    (len > MAX_OPEN_BYTES).then(|| format!("document is {len} bytes; the largest DeckCraft opens from the host is {MAX_OPEN_BYTES} bytes (512 MiB)"))
+}
 
 #[derive(Clone)]
 pub struct Bridge {
@@ -120,7 +129,14 @@ impl Bridge {
                 return;
             }
             let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Presentation.deckcraft".to_string());
-            let Some(bytes) = bytes(&data) else { return };
+            let Some(array) = byte_array(&data) else { return };
+            if let Some(error) = oversize(u64::from(array.byte_length())) {
+                if let Some(m) = message(&[("type", "deckcraft:failed".into()), ("error", error.as_str().into())]) {
+                    let _ = parent.post_message(&m, &origin);
+                }
+                return;
+            }
+            let bytes = array.to_vec();
             received.borrow_mut().push((name, bytes));
             ctx.request_repaint();
         });
@@ -148,14 +164,25 @@ fn string(data: &JsValue, key: &str) -> Option<String> {
     js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_string()
 }
 
-/// `bytes` as an `ArrayBuffer` or `Uint8Array`.
-fn bytes(data: &JsValue) -> Option<Vec<u8>> {
+/// `bytes` (an `ArrayBuffer` or `Uint8Array`) as a view, not yet copied.
+fn byte_array(data: &JsValue) -> Option<js_sys::Uint8Array> {
     let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
     if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
-        Some(array.to_vec())
+        Some(array.clone())
     } else if bytes.is_instance_of::<js_sys::ArrayBuffer>() {
-        Some(js_sys::Uint8Array::new(&bytes).to_vec())
+        Some(js_sys::Uint8Array::new(&bytes))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_cap() {
+        assert!(oversize(MAX_OPEN_BYTES).is_none());
+        assert!(oversize(MAX_OPEN_BYTES + 1).is_some_and(|e| e.contains("512 MiB")));
     }
 }
