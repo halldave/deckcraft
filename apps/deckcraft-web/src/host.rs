@@ -57,8 +57,8 @@ pub struct Bridge {
     origin: String,
     /// The unsaved-changes state last reported to the parent.
     reported: Rc<Cell<Option<bool>>>,
-    /// Request ids of the `.deckcraft` saves posted since the last frame.
-    posted: Rc<RefCell<Vec<u64>>>,
+    /// The `.deckcraft` saves posted since the last frame: request id and a hash of the bytes.
+    posted: Rc<RefCell<Vec<(u64, u64)>>>,
     /// Saves waiting for `deckcraft:saved`.
     acks: Rc<RefCell<SaveAcks<Posted>>>,
     /// Request ids the parent confirmed since the last frame.
@@ -100,7 +100,7 @@ impl Bridge {
         services.download = Some(Box::new(move |name: &str, bytes: &[u8]| match bridge.post_save(name, bytes) {
             Ok((name, id)) => {
                 if name.to_ascii_lowercase().ends_with(".deckcraft") {
-                    bridge.posted.borrow_mut().push(id);
+                    bridge.posted.borrow_mut().push((id, crate::bridge::bytes_hash(bytes)));
                 }
             }
             Err(e) => {
@@ -124,11 +124,19 @@ impl Bridge {
     pub fn sync(&self, app: &mut SlideApp, ctx: &egui::Context) {
         // Before any open below can change the active presentation: the saves posted since the
         // last frame came from the active one.
+        // The snapshot is attached only if it is what was posted: an edit later in the same frame
+        // (a key typed after Ctrl+S in one input batch) changes it, and that save then confirms
+        // nothing, leaving the presentation dirty.
         let posted = std::mem::take(&mut *self.posted.borrow_mut());
-        if let Some(d) = app.session.active() {
+        if !posted.is_empty()
+            && let Some(d) = app.session.active()
+        {
+            let now = deckcraft_engine::cmd::file::save_bytes(&d.doc, "deckcraft").ok().map(|b| crate::bridge::bytes_hash(&b));
             let mut acks = self.acks.borrow_mut();
-            for id in posted {
-                acks.attach(id, (d.uid, d.doc.clone()));
+            for (id, hash) in posted {
+                if now == Some(hash) {
+                    acks.attach(id, (d.uid, d.doc.clone()));
+                }
             }
         }
         for id in std::mem::take(&mut *self.confirmed.borrow_mut()) {

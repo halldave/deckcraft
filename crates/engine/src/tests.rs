@@ -4092,3 +4092,15 @@ fn confirm_saved_marks_only_the_posted_snapshot() {
     assert!(s.doc().unwrap().is_dirty(), "edits after the posted save stay unsaved");
     assert!(!s.confirm_saved(u64::MAX, s.doc().unwrap().doc.clone()), "a closed document confirms nothing");
 }
+
+/// The web host bridge confirms a save only when the presentation still serialises to the bytes
+/// it posted, so saving the same presentation twice must give the same bytes.
+#[test]
+fn deckcraft_save_bytes_are_deterministic() {
+    let mut s = session();
+    s.execute("slide.new", &json!({})).unwrap();
+    let doc = s.doc().unwrap().doc.clone();
+    let a = crate::cmd::file::save_bytes(&doc, "deckcraft").unwrap();
+    let b = crate::cmd::file::save_bytes(&doc, "deckcraft").unwrap();
+    assert_eq!(a, b);
+}

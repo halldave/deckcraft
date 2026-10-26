@@ -103,6 +103,14 @@ impl<T> SaveAcks<T> {
     }
 }
 
+/// A hash of saved bytes, to tell whether a snapshot taken later is the one that was posted.
+pub fn bytes_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +161,11 @@ mod tests {
         assert!(acks.expire(1_000.0 + SAVE_ACK_TIMEOUT_MS - 1.0).is_empty());
         assert_eq!(acks.expire(1_000.0 + SAVE_ACK_TIMEOUT_MS), vec![(id, "Deck.deckcraft".to_string())]);
         assert_eq!(acks.saved(id), None, "a late confirmation is ignored: the save was reported failed");
+    }
+
+    #[test]
+    fn bytes_hash_tells_saves_apart() {
+        assert_eq!(bytes_hash(b"deck"), bytes_hash(b"deck"));
+        assert_ne!(bytes_hash(b"deck"), bytes_hash(b"deck!"));
     }
 }
