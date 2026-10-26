@@ -4,24 +4,40 @@
 //! - `deckcraft:ready` (to the parent): `{ version }`, the app is listening; send a file now.
 //! - `deckcraft:open` (from the parent): `{ name, bytes }`, bytes an `ArrayBuffer` or
 //!   `Uint8Array`. It opens like a presentation dropped on the window.
-//! - `deckcraft:save` (to the parent): `{ name, bytes }` (a transferred `ArrayBuffer`) for every
-//!   file DeckCraft would otherwise download: Save, Save As, the exports and Print's PDF. Save
-//!   writes `<title>.deckcraft`; posting a `.deckcraft` file marks the presentation saved.
+//! - `deckcraft:save` (to the parent): `{ id, name, bytes }` (a transferred `ArrayBuffer`) for
+//!   every file DeckCraft would otherwise download: Save, Save As, the exports and Print's PDF.
+//!   Save writes `<title>.deckcraft`.
+//! - `deckcraft:saved` (from the parent): `{ id }`, the file from that `deckcraft:save` is stored.
+//!   A `.deckcraft` save marks its presentation saved (as it was when posted) only then. With no
+//!   answer in 30 s the app posts `deckcraft:failed { id, error }` and the presentation stays
+//!   unsaved.
 //! - `deckcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
 //! - `deckcraft:failed` (to the parent): `{ error }` when the app couldn't start, or a
-//!   `deckcraft:open` was refused (over `MAX_OPEN_BYTES`, 512 MiB).
+//!   `deckcraft:open` was refused (it, plus the documents still waiting to open, is over
+//!   `MAX_OPEN_BYTES`, 512 MiB), or a save went unconfirmed.
 //!
-//! Only the parent window on the page's own origin is heard or answered. In host mode the page
+//! The bridge is installed only for a same-origin parent, or for a parent on the origin named by
+//! `?host_origin=` (a bare `scheme://host[:port]` origin); messages go to that exact origin and only
+//! the parent window on it is heard. A cross-origin parent without `host_origin` gets no bridge:
+//! files download as usual. In host mode the page
 //! starts on a blank presentation instead of the sample deck. `?author=` names the user
 //! (comments and the author of new presentations).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use std::sync::Arc;
+
+use deckcraft_engine::model::Presentation;
 use deckcraft_ui_egui::{Services, SlideApp};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
+
+use crate::bridge::SaveAcks;
+
+/// A presentation save waiting for the parent: which presentation (`uid`), as it was when posted.
+type Posted = (u64, Arc<Presentation>);
 
 /// The longest user name taken from `?author=` (the preference's own limit).
 const MAX_AUTHOR_CHARS: usize = 256;
@@ -41,22 +57,39 @@ pub struct Bridge {
     origin: String,
     /// The unsaved-changes state last reported to the parent.
     reported: Rc<Cell<Option<bool>>>,
-    /// Names of the files posted to the parent since the last frame.
-    posted: Rc<RefCell<Vec<String>>>,
+    /// Request ids of the `.deckcraft` saves posted since the last frame.
+    posted: Rc<RefCell<Vec<u64>>>,
+    /// Saves waiting for `deckcraft:saved`.
+    acks: Rc<RefCell<SaveAcks<Posted>>>,
+    /// Request ids the parent confirmed since the last frame.
+    confirmed: Rc<RefCell<Vec<u64>>>,
     /// Files the parent sent, waiting for the next frame.
     received: Rc<RefCell<Vec<(String, Vec<u8>)>>>,
 }
 
 impl Bridge {
-    /// `None` when the page isn't framed (there is no parent to talk to).
-    pub fn new() -> Option<Self> {
+    /// `None` when the page isn't framed, or the parent is cross-origin and not the origin
+    /// `host_origin` allows (see [`crate::bridge::target_origin`]).
+    pub fn new(host_origin: Option<&str>) -> Option<Self> {
         let window = web_sys::window()?;
         let parent = window.parent().ok().flatten()?;
         if js_sys::Object::is(&parent, &window) {
             return None;
         }
-        let origin = window.location().origin().ok()?;
-        Some(Self { window, parent, origin, reported: Rc::default(), posted: Rc::default(), received: Rc::default() })
+        let own = window.location().origin().ok()?;
+        // Reading a cross-origin parent's location throws: treat that as cross-origin.
+        let parent_origin = parent.location().origin().ok();
+        let origin = crate::bridge::target_origin(&own, parent_origin.as_deref(), host_origin)?;
+        Some(Self {
+            window,
+            parent,
+            origin,
+            reported: Rc::default(),
+            posted: Rc::default(),
+            acks: Rc::default(),
+            confirmed: Rc::default(),
+            received: Rc::default(),
+        })
     }
 
     /// Send saved and exported files to the parent instead of downloading them, and hear files
@@ -65,8 +98,15 @@ impl Bridge {
         self.listen(ctx);
         let bridge = self.clone();
         services.download = Some(Box::new(move |name: &str, bytes: &[u8]| match bridge.post_save(name, bytes) {
-            Ok(name) => bridge.posted.borrow_mut().push(name),
-            Err(e) => log::error!("couldn't hand {name} to the host: {e}"),
+            Ok((name, id)) => {
+                if name.to_ascii_lowercase().ends_with(".deckcraft") {
+                    bridge.posted.borrow_mut().push(id);
+                }
+            }
+            Err(e) => {
+                log::error!("couldn't hand {name} to the host: {e}");
+                bridge.post_failed(&format!("couldn't hand {name} to the host: {e}"));
+            }
         }));
     }
 
@@ -78,17 +118,38 @@ impl Bridge {
         }
     }
 
-    /// Once a frame: open what the parent sent, mark a natively saved presentation clean, and
-    /// report unsaved changes.
-    pub fn sync(&self, app: &mut SlideApp) {
+    /// Once a frame: note which presentation each new save is for, mark presentations the parent
+    /// confirmed saved, fail saves it didn't confirm in time, open what it sent, and report
+    /// unsaved changes.
+    pub fn sync(&self, app: &mut SlideApp, ctx: &egui::Context) {
+        // Before any open below can change the active presentation: the saves posted since the
+        // last frame came from the active one.
+        let posted = std::mem::take(&mut *self.posted.borrow_mut());
+        if let Some(d) = app.session.active() {
+            let mut acks = self.acks.borrow_mut();
+            for id in posted {
+                acks.attach(id, (d.uid, d.doc.clone()));
+            }
+        }
+        for id in std::mem::take(&mut *self.confirmed.borrow_mut()) {
+            let payload = self.acks.borrow_mut().saved(id);
+            if let Some(Some((uid, snapshot))) = payload {
+                app.session.confirm_saved(uid, snapshot);
+            }
+        }
+        let expired = self.acks.borrow_mut().expire(js_sys::Date::now());
+        for (id, name) in expired {
+            self.send(&[
+                ("type", "deckcraft:failed".into()),
+                ("id", JsValue::from_f64(id as f64)),
+                ("error", format!("{name}: the host page didn't confirm the save").into()),
+            ]);
+        }
+        if self.acks.borrow().waiting() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
         for (name, bytes) in std::mem::take(&mut *self.received.borrow_mut()) {
             app.open_or_insert_bytes(&name, &bytes);
-        }
-        let posted = std::mem::take(&mut *self.posted.borrow_mut());
-        if posted.iter().any(|n| n.to_ascii_lowercase().ends_with(".deckcraft"))
-            && let Some(d) = app.session.active_mut()
-        {
-            d.saved_doc = d.doc.clone();
         }
         let dirty = app.session.active().is_some_and(|d| d.is_dirty());
         if self.reported.get() != Some(dirty) && self.send(&[("type", "deckcraft:dirty".into()), ("dirty", dirty.into())]) {
@@ -104,33 +165,59 @@ impl Bridge {
         self.send(&[("type", "deckcraft:failed".into()), ("error", error.into())]);
     }
 
-    /// Post a file to the parent; the name it went under.
-    fn post_save(&self, path: &str, bytes: &[u8]) -> Result<String, String> {
+    /// Post a file to the parent; the name it went under and its request id.
+    fn post_save(&self, path: &str, bytes: &[u8]) -> Result<(String, u64), String> {
         let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
         let buffer = js_sys::Uint8Array::from(bytes).buffer();
-        let message = message(&[("type", "deckcraft:save".into()), ("name", name.as_str().into()), ("bytes", buffer.clone().into())])
-            .ok_or_else(|| "couldn't build the message".to_string())?;
-        self.parent
-            .post_message_with_transfer(&message, &self.origin, &js_sys::Array::of1(&buffer))
-            .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))?;
-        Ok(name)
+        let id = self.acks.borrow_mut().posted(&name, js_sys::Date::now());
+        let sent = message(&[
+            ("type", "deckcraft:save".into()),
+            ("id", JsValue::from_f64(id as f64)),
+            ("name", name.as_str().into()),
+            ("bytes", buffer.clone().into()),
+        ])
+        .ok_or_else(|| "couldn't build the message".to_string())
+        .and_then(|m| {
+            self.parent
+                .post_message_with_transfer(&m, &self.origin, &js_sys::Array::of1(&buffer))
+                .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))
+        });
+        match sent {
+            Ok(()) => Ok((name, id)),
+            Err(e) => {
+                self.acks.borrow_mut().failed(id);
+                Err(e)
+            }
+        }
     }
 
     fn listen(&self, ctx: egui::Context) {
         let parent = self.parent.clone();
         let origin = self.origin.clone();
         let received = self.received.clone();
+        let confirmed = self.confirmed.clone();
         let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
                 return;
             }
             let data = event.data();
-            if string(&data, "type").as_deref() != Some("deckcraft:open") {
-                return;
+            match string(&data, "type").as_deref() {
+                Some("deckcraft:open") => {}
+                Some("deckcraft:saved") => {
+                    let id = js_sys::Reflect::get(&data, &JsValue::from_str("id")).ok().and_then(|v| v.as_f64());
+                    if let Some(id) = id.filter(|id| id.is_finite() && *id >= 0.0 && id.fract() == 0.0) {
+                        confirmed.borrow_mut().push(id as u64);
+                        ctx.request_repaint();
+                    }
+                    return;
+                }
+                _ => return,
             }
             let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "Presentation.deckcraft".to_string());
             let Some(array) = byte_array(&data) else { return };
-            if let Some(error) = oversize(u64::from(array.byte_length())) {
+            // The cap covers this document plus any still waiting for the next frame.
+            let queued: u64 = received.borrow().iter().map(|(_, b)| b.len() as u64).sum();
+            if let Some(error) = oversize(queued.saturating_add(u64::from(array.byte_length()))) {
                 if let Some(m) = message(&[("type", "deckcraft:failed".into()), ("error", error.as_str().into())]) {
                     let _ = parent.post_message(&m, &origin);
                 }

@@ -24,7 +24,8 @@ pub fn start() {
         };
         // `?host=parent`: a same-origin page framing DeckCraft opens presentations in it and
         // stores what it saves (`host`).
-        let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
+        let bridge =
+            if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new(query_param("host_origin").as_deref()) } else { None };
         let app_bridge = bridge.clone();
         let mut options = eframe::WebOptions::default();
         if query().contains("webgl")
@@ -54,11 +55,10 @@ pub fn start() {
                     } else if let Err(e) = app.run("file.new", serde_json::json!({})) {
                         log::error!("new presentation: {e}");
                     }
-                    if let Some(bridge) = &app_bridge {
+                    if app_bridge.is_some() {
                         if let Some(author) = query_param("author") {
                             crate::host::Bridge::set_author(&mut app, &author);
                         }
-                        bridge.post_ready();
                     } else if q.contains("show") {
                         app.start_show(0, false);
                     }
@@ -66,8 +66,12 @@ pub fn start() {
                 }),
             )
             .await;
-        if let (Err(e), Some(bridge)) = (&result, &bridge) {
-            bridge.post_failed(&format!("{e:?}"));
+        // Ready only once the runner started; otherwise the parent hears why it didn't.
+        if let Some(bridge) = &bridge {
+            match &result {
+                Ok(()) => bridge.post_ready(),
+                Err(e) => bridge.post_failed(&format!("{e:?}")),
+            }
         }
         if let Some(el) = document.get_element_by_id(LOADING_ID) {
             match result {
@@ -119,7 +123,7 @@ impl eframe::App for WebShell {
             });
         }
         if let Some(bridge) = &self.bridge {
-            bridge.sync(&mut self.app);
+            bridge.sync(&mut self.app, ctx);
         }
         self.app.logic(ctx);
     }
@@ -131,7 +135,7 @@ impl eframe::App for WebShell {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
         if let Some(bridge) = &self.bridge {
-            bridge.sync(&mut self.app);
+            bridge.sync(&mut self.app, ui.ctx());
         }
     }
 }
