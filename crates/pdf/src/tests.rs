@@ -1,6 +1,15 @@
 use std::sync::Arc;
 
-use super::*;
+use std::collections::HashMap;
+
+use deckcraft_fonts::FontDb;
+use deckcraft_render::RenderOpts;
+use kurbo::Rect;
+
+use super::{
+    MAX_RASTER_PIXELS, PAPERS, PageLayout, PdfError, PdfOptions, Presentation, export, glyph_text_ranges, handout_boxes, master_text_pieces,
+    master_texts, notes_frames, notes_slide_box, paper_size, raster_scale,
+};
 use deckcraft_model::text::TextBody;
 
 fn deck(n: usize) -> Presentation {
@@ -128,6 +137,65 @@ fn text_layer_links_and_bookmarks_survive_serialization() {
         let first = outlines.get::<Dict<'_>>(b"First").unwrap();
         assert!(first.get::<Dict<'_>>(b"Next").is_some());
     }
+}
+
+/// Links from an untrusted deck: only web and mail links become PDF links. Scripts, `data:`,
+/// local and relative files, OS protocol handlers and network shares (a UNC path leaks the user's
+/// NTLM credentials on Windows) do not.
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+fn unsafe_url_links_are_not_exported() {
+    use deckcraft_model::text::{Action, Hyperlink};
+    use deckcraft_model::{Shape, ShapeId, Xfrm};
+    use hayro_syntax::object::{Array, Dict, String as PdfString};
+    let safe = ["https://example.com/deck", "mailto:someone@example.com"];
+    let refused = [
+        "file:///C:/talks/notes.pdf",
+        "notes.pdf",
+        "ms-msdt:/id PCWDiagnostic /skip force",
+        "ms-word:ofe|u|\\\\attacker.example\\share\\x.docx",
+        "ldap://attacker.example/x",
+        "file:///%5C%5Cattacker.example/share/x",
+        "javascript:alert(1)",
+        "\t JavaScript:alert(1)",
+        "java\nscript:alert(1)",
+        "vbscript:MsgBox(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "\\\\attacker.example\\share\\x",
+        "//attacker.example/share/x",
+        "file://attacker.example/share/x",
+        "file:////attacker.example/share/x",
+        "smb://attacker.example/share/x",
+        "search-ms:query=x&crumb=location:\\\\attacker.example\\share",
+        "search:query=x&crumb=location:\\\\attacker.example\\share",
+    ];
+    let mut p = deck(1);
+    let slide = Arc::make_mut(&mut p.slides[0]);
+    slide.shapes = (0..)
+        .zip(safe.iter().chain(&refused))
+        .map(|(i, url)| Shape {
+            id: ShapeId(9000 + i),
+            xfrm: Some(Xfrm::new(20.0, 20.0 + 32.0 * f64::from(i), 400.0, 26.0)),
+            click: Some(Hyperlink {
+                action: Action::Url { url: url.to_string() },
+                tooltip: String::new(),
+                highlight_click: false,
+                sound: None,
+                stop_sound: false,
+                zoom_return: None,
+            }),
+            ..Default::default()
+        })
+        .collect();
+    let bytes = export(&p, &opts(PageLayout::Slides)).unwrap();
+    let pdf = hayro_syntax::Pdf::new(bytes.clone()).unwrap();
+    let annotations = pdf.pages()[0].raw().get::<Array<'_>>(b"Annots").unwrap();
+    let uris: Vec<String> = annotations
+        .iter::<Dict<'_>>()
+        .filter_map(|a| a.get::<Dict<'_>>(b"A")?.get::<PdfString<'_>>(b"URI"))
+        .map(|s| String::from_utf8_lossy(s.as_bytes()).into_owned())
+        .collect();
+    assert_eq!(uris, safe);
 }
 
 /// Build a small damaged derivative of our openly licensed last-resort font entirely in
@@ -529,4 +597,15 @@ fn glyph_ranges_follow_shaping_clusters() {
     assert_eq!(glyph_text_ranges("ab", (0, 2), &[(0, 'a'), (0, 'a'), (1, 'b')], 3), vec![0..1, 0..1, 1..2]);
     // A run starting mid-paragraph, multi-byte characters in visual (right-to-left) order.
     assert_eq!(glyph_text_ranges("αβγ", (3, 6), &[(5, 'γ'), (4, 'β'), (3, 'α')], 3), vec![4..6, 2..4, 0..2]);
+}
+
+#[test]
+fn raster_scale_caps_total_pixels_not_each_side() {
+    // A huge square slide at 600 dpi would be 16,000 x 16,000 px (~1 GB RGBA) without the cap.
+    let s = raster_scale(20_000.0, (20_000.0, 20_000.0), 600.0);
+    let px = 20_000.0 * s * 20_000.0 * s;
+    assert!(px <= MAX_RASTER_PIXELS * 1.0001, "{px}");
+    // A normal slide keeps the requested dpi.
+    let s = raster_scale(720.0, (960.0, 540.0), 200.0);
+    assert!((s - 720.0 / 72.0 * 200.0 / 960.0).abs() < 1e-12);
 }
